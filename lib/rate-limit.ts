@@ -9,7 +9,13 @@
  */
 
 const WINDOW_MS = 60_000;
-const LIMIT = 10;
+// Per-IP block-generations per minute. Higher than the old default of 10 because
+// a single user now pre-generates their own 60-question exam in the background.
+// Override with RATE_LIMIT_PER_MIN.
+const LIMIT = (() => {
+  const raw = Number(process.env.RATE_LIMIT_PER_MIN);
+  return Number.isInteger(raw) && raw > 0 ? raw : 40;
+})();
 
 const hits = new Map<string, number[]>();
 

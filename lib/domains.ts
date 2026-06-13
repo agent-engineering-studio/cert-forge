@@ -3,41 +3,50 @@ import type { BlockPlanItem, DomainCode } from './types';
 export interface DomainInfo {
   code: DomainCode;
   name: string;
+  /** Official share of scored content (per the exam guide). */
+  weightPct: number;
   /** Number of questions this domain contributes to a 60-question full mock. */
   fullMockQuestions: number;
   blurb: string;
 }
 
+// Question counts follow the official exam-guide weighting (% of scored content),
+// scaled to a 60-question full mock: 27/18/20/20/15 → 16/11/12/12/9 = 60.
 export const DOMAINS: DomainInfo[] = [
   {
     code: 'D1',
     name: 'Agentic Architecture & Orchestration',
-    fullMockQuestions: 18,
+    weightPct: 27,
+    fullMockQuestions: 16,
     blurb:
       'Designing agent loops, sub-agent delegation, control flow, and recovery. The heaviest-weighted domain.',
   },
   {
     code: 'D2',
     name: 'Tool Design & MCP Integration',
-    fullMockQuestions: 12,
+    weightPct: 18,
+    fullMockQuestions: 11,
     blurb: 'Scoping tool schemas, choosing bash vs. dedicated tools, and wiring MCP servers safely.',
   },
   {
     code: 'D3',
     name: 'Claude Code Configuration & Workflows',
-    fullMockQuestions: 10,
+    weightPct: 20,
+    fullMockQuestions: 12,
     blurb: 'Configuring Claude Code and composing dependable engineering workflows.',
   },
   {
     code: 'D4',
     name: 'Prompt Engineering & Structured Output',
-    fullMockQuestions: 10,
+    weightPct: 20,
+    fullMockQuestions: 12,
     blurb: 'Prompt structure, salience, structured/JSON output, and prompt-cache-aware design.',
   },
   {
     code: 'D5',
     name: 'Context Management & Reliability',
-    fullMockQuestions: 10,
+    weightPct: 15,
+    fullMockQuestions: 9,
     blurb: 'Compaction, context editing, caching, and keeping long-running systems reliable.',
   },
 ];
@@ -56,39 +65,38 @@ export function isDomainCode(v: unknown): v is DomainCode {
 }
 
 /**
- * Split a question count into block sizes, each between 3 and 6 (the API's
- * allowed range). Greedy 6s, but never leaves a remainder below 3.
+ * Split a question count into block sizes, each between 3 and 5 (3 is the
+ * exam's scenario-anchoring minimum). We favor SMALL blocks (3) on purpose:
+ * each block is one live Claude generation the user waits on, so smaller blocks
+ * mean the first question appears much sooner and later blocks prefetch while
+ * answering. Never leaves a remainder below 3.
  */
 export function splitCount(n: number): number[] {
   const parts: number[] = [];
   let rem = n;
   while (rem > 0) {
-    if (rem <= 6) {
-      parts.push(rem);
+    if (rem <= 5) {
+      parts.push(rem); // 3, 4, or 5 → a single final block
       break;
     }
-    if (rem - 6 >= 3) {
-      parts.push(6);
-      rem -= 6;
-    } else {
-      // rem is 7 or 8 -> leave a clean block of 3
-      parts.push(rem - 3);
-      rem = 3;
-    }
+    parts.push(3);
+    rem -= 3;
   }
   return parts;
 }
 
+// One question per block: each is a tiny, fast generation the user waits on
+// only briefly (with the timer paused), instead of one big multi-question block.
 export function buildFullMockPlan(): BlockPlanItem[] {
   const plan: BlockPlanItem[] = [];
   for (const d of DOMAINS) {
-    for (const count of splitCount(d.fullMockQuestions)) {
-      plan.push({ domain: d.code, count });
+    for (let i = 0; i < d.fullMockQuestions; i++) {
+      plan.push({ domain: d.code, count: 1 });
     }
   }
   return plan;
 }
 
 export function buildSingleDomainPlan(domain: DomainCode): BlockPlanItem[] {
-  return splitCount(SINGLE_DOMAIN_QUESTIONS).map((count) => ({ domain, count }));
+  return Array.from({ length: SINGLE_DOMAIN_QUESTIONS }, () => ({ domain, count: 1 }));
 }

@@ -43,9 +43,18 @@ export default function ExamRunner() {
   const [notFound, setNotFound] = useState(false);
   const [apiKeyMissing, setApiKeyMissing] = useState(false);
   const [error, setError] = useState<FetchError | null>(null);
+  // Live text of the block currently being streamed from Claude (null when idle).
+  const [streaming, setStreaming] = useState<{ index: number; text: string } | null>(null);
   const [now, setNow] = useState<number>(() => Date.now());
   const fetching = useRef<Set<number>>(new Set());
   const lastSaved = useRef<string | null>(null);
+  // When set, the clock is paused (we're waiting for the current block to
+  // generate) — the value is the wall-clock time the pause began.
+  const pauseStartRef = useRef<number | null>(null);
+  // Always-current snapshot of state for use inside callbacks (reading state via
+  // a setState updater is not reliably synchronous in React 19).
+  const stateRef = useRef<ExamState | null>(state);
+  stateRef.current = state;
 
   // --- Load the session from the server. ---
   useEffect(() => {
@@ -134,6 +143,22 @@ export default function ExamRunner() {
     setState((s) => (s && s.startedAt === 0 ? { ...s, startedAt: Date.now() } : s));
   }, [state]);
 
+  // --- Pause the clock whenever we're waiting for the current block. ---
+  // The user shouldn't lose exam time to generation latency. While the current
+  // block is missing we freeze the countdown; when it arrives we push startedAt
+  // forward by the paused duration so the deadline slides and no time is lost.
+  useEffect(() => {
+    if (!state || state.startedAt === 0 || state.finished) return;
+    const waiting = !state.blocks[state.blockIdx];
+    if (waiting && pauseStartRef.current === null) {
+      pauseStartRef.current = Date.now();
+    } else if (!waiting && pauseStartRef.current !== null) {
+      const pausedFor = Date.now() - pauseStartRef.current;
+      pauseStartRef.current = null;
+      setState((s) => (s ? { ...s, startedAt: s.startedAt + pausedFor } : s));
+    }
+  }, [state]);
+
   // --- Countdown tick (full mock only, once started). ---
   useEffect(() => {
     if (!state || state.mode !== 'full' || state.finished || state.startedAt === 0) return;
@@ -145,12 +170,7 @@ export default function ExamRunner() {
   const loadBlock = useCallback(
     async (index: number) => {
       if (!sessionId) return;
-      let snapshot: ExamState | null = null;
-      setState((s) => {
-        snapshot = s;
-        return s;
-      });
-      const current = snapshot as ExamState | null;
+      const current = stateRef.current;
       if (!current) return;
       if (current.blocks[index] || fetching.current.has(index)) return;
       if (index < 0 || index >= current.plan.length) return;
@@ -195,25 +215,135 @@ export default function ExamRunner() {
     [sessionId],
   );
 
-  // --- Ensure the current block is loaded, then prefetch the next. ---
+  // --- Stream the current block from Claude, rendering it as it's written. ---
+  const streamBlock = useCallback(
+    async (index: number) => {
+      if (!sessionId) return;
+      const current = stateRef.current;
+      if (!current) return;
+      if (current.blocks[index] || fetching.current.has(index)) return;
+      if (index < 0 || index >= current.plan.length) return;
+      fetching.current.add(index);
+      setStreaming({ index, text: '' });
+
+      const startedAt = Date.now();
+      let gotTerminal = false; // saw a `complete` or `error` event (or a definitive failure)
+      console.info(`[exam] Streaming block #${index}…`);
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}/blocks/${index}/stream`);
+        if (!res.ok || !res.body) {
+          const data = await res.json().catch(() => ({}) as Record<string, unknown>);
+          if (data?.code === 'NO_API_KEY') setApiKeyMissing(true);
+          else
+            setError({
+              message: (data?.error as string) || `Request failed (${res.status}).`,
+              code: (data?.code as string) || 'ERROR',
+            });
+          setStreaming(null);
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let acc = '';
+        let finished = false;
+        while (!finished) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let sep: number;
+          while ((sep = buf.indexOf('\n\n')) >= 0) {
+            const rawEvent = buf.slice(0, sep);
+            buf = buf.slice(sep + 2);
+            const lines = rawEvent.split('\n');
+            const event = lines.find((l) => l.startsWith('event:'))?.slice(6).trim() ?? 'message';
+            const dataLine = lines.find((l) => l.startsWith('data:'));
+            if (!dataLine) continue;
+            let data: { text?: string; block?: DomainBlock; cached?: boolean; error?: string; code?: string };
+            try {
+              data = JSON.parse(dataLine.slice(5).trim());
+            } catch {
+              continue;
+            }
+            if (event === 'delta') {
+              acc += data.text ?? '';
+              setStreaming({ index, text: acc });
+            } else if (event === 'complete') {
+              console.info(
+                `[exam] Block #${index} complete in ${Date.now() - startedAt}ms (cached: ${data.cached === true}).`,
+              );
+              setState((s) => {
+                if (!s) return s;
+                const blocks = [...s.blocks];
+                blocks[index] = data.block as DomainBlock;
+                return { ...s, blocks };
+              });
+              setStreaming(null);
+              setError(null);
+              gotTerminal = true;
+              finished = true;
+            } else if (event === 'error') {
+              if (data.code === 'NO_API_KEY') setApiKeyMissing(true);
+              else setError({ message: data.error || 'Generation failed.', code: data.code || 'ERROR' });
+              setStreaming(null);
+              gotTerminal = true;
+              finished = true;
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[exam] Stream #${index} error after ${Date.now() - startedAt}ms`, err);
+        setError({
+          message: 'Network error contacting the server. Check your connection and retry.',
+          code: 'NETWORK',
+        });
+        setStreaming(null);
+        gotTerminal = true;
+      } finally {
+        fetching.current.delete(index);
+      }
+
+      // Stream ended without a result (connection dropped mid-generation). The
+      // server keeps generating and caches the block, so fall back to the plain
+      // JSON endpoint, which returns it (cached → instant, or regenerated).
+      if (!gotTerminal) {
+        console.warn(`[exam] Stream #${index} dropped without completing — falling back to JSON fetch`);
+        setStreaming(null);
+        loadBlock(index);
+      }
+    },
+    [sessionId, loadBlock],
+  );
+
+  // --- Stream the current block, then pre-generate the rest in the background. ---
+  // The current block streams live; every other not-yet-generated block is
+  // pre-fetched concurrently (bounded) and saved, so once the first question is
+  // up the whole exam fills in behind the scenes and later questions are instant.
   useEffect(() => {
     if (!state || state.finished || apiKeyMissing) return;
     if (!state.blocks[state.blockIdx]) {
-      if (!error) loadBlock(state.blockIdx);
+      if (!error && streaming?.index !== state.blockIdx) streamBlock(state.blockIdx);
       return;
     }
-    const next = state.blockIdx + 1;
-    if (next < state.plan.length && !state.blocks[next]) {
-      loadBlock(next);
+    // Background pre-generation: keep up to MAX_INFLIGHT generations running,
+    // filling ahead from the current question to the end of the exam.
+    const MAX_INFLIGHT = 3;
+    for (let i = state.blockIdx + 1; i < state.plan.length; i++) {
+      if (fetching.current.size >= MAX_INFLIGHT) break;
+      if (!state.blocks[i] && !fetching.current.has(i)) loadBlock(i);
     }
-  }, [state, error, apiKeyMissing, loadBlock]);
+  }, [state, error, apiKeyMissing, loadBlock, streamBlock, streaming]);
 
   // --- Timer + auto-finish. ---
+  // While paused (waiting for a block), freeze the clock at the pause start so
+  // the countdown doesn't move; startedAt is reconciled when the block arrives.
+  const effectiveNow = pauseStartRef.current ?? now;
   const remainingMs =
     state && state.mode === 'full'
       ? state.startedAt === 0
         ? FULL_MOCK_LIMIT_MS
-        : Math.max(0, state.startedAt + FULL_MOCK_LIMIT_MS - now)
+        : Math.max(0, state.startedAt + FULL_MOCK_LIMIT_MS - effectiveNow)
       : null;
 
   useEffect(() => {
@@ -251,7 +381,7 @@ export default function ExamRunner() {
 
   const retry = () => {
     setError(null);
-    if (state) loadBlock(state.blockIdx);
+    if (state) streamBlock(state.blockIdx);
   };
 
   // --- Render ---
@@ -326,11 +456,10 @@ export default function ExamRunner() {
               Retry
             </button>
           </div>
+        ) : streaming && streaming.index === state.blockIdx && streaming.text ? (
+          <StreamingPreview text={streaming.text} />
         ) : (
-          <GeneratingScreen
-            count={state.plan[state.blockIdx].count}
-            isFirst={state.blockIdx === 0 && score.total === 0}
-          />
+          <GeneratingScreen />
         )
       ) : (
         <QuestionView
@@ -354,7 +483,7 @@ export default function ExamRunner() {
  * block), so we show an elapsed counter and rotate through the steps the
  * server is actually working through, plus reassurance once it runs long.
  */
-function GeneratingScreen({ count, isFirst }: { count: number; isFirst: boolean }) {
+function GeneratingScreen() {
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
@@ -364,10 +493,7 @@ function GeneratingScreen({ count, isFirst }: { count: number; isFirst: boolean 
 
   const steps = [
     'Asking Claude…',
-    'Authoring an original production scenario…',
-    `Writing ${count} question${count === 1 ? '' : 's'} with four options each…`,
-    'Drafting the option-by-option explanations…',
-    'Validating the exam block…',
+    'Writing the scenario, options, and worked explanations…',
   ];
   const stepIdx = Math.min(steps.length - 1, Math.floor(elapsed / 6));
 
@@ -376,14 +502,84 @@ function GeneratingScreen({ count, isFirst }: { count: number; isFirst: boolean 
       <div className="spinner" />
       <p className="loading-step">{steps[stepIdx]}</p>
       <p className="muted small loading-meta">
-        Questions are generated live by Claude — {elapsed}s elapsed
+        Generating the next question live — {elapsed}s (the timer is paused while you wait)
       </p>
-      {elapsed >= 20 && (
+      {elapsed >= 25 && (
         <p className="muted small loading-hint">
-          {isFirst
-            ? 'The first scenario takes the longest. Hang tight — your progress is saved and resumable.'
-            : 'Still working — complex scenarios can take a little longer.'}
+          Each question is written on demand (usually ~20–40s, varies with Claude API load). Your
+          progress is saved and resumable if you leave.
         </p>
+      )}
+    </div>
+  );
+}
+
+/** Pulls completed string fields out of partial (still-streaming) block JSON. */
+function parsePartialBlock(text: string): {
+  title?: string;
+  scenario?: string;
+  stem?: string;
+  options?: Partial<Record<OptionKey, string>>;
+} {
+  const field = (src: string, key: string): string | undefined => {
+    const m = src.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+    if (!m) return undefined;
+    try {
+      return JSON.parse(`"${m[1]}"`);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const title = field(text, 'scenario_title');
+  const scenario = field(text, 'scenario');
+  const stem = field(text, 'stem');
+
+  let options: Partial<Record<OptionKey, string>> | undefined;
+  const optIdx = text.indexOf('"options"');
+  if (optIdx >= 0) {
+    const corrIdx = text.indexOf('"correct"', optIdx);
+    const seg = text.slice(optIdx, corrIdx >= 0 ? corrIdx : undefined);
+    const o: Partial<Record<OptionKey, string>> = {};
+    for (const k of OPTION_KEYS) {
+      const v = field(seg, k);
+      if (v !== undefined) o[k] = v;
+    }
+    if (Object.keys(o).length) options = o;
+  }
+  return { title, scenario, stem, options };
+}
+
+/** Renders the question as it streams in — the scenario, stem, and options pop
+ *  in field-by-field as Claude writes them, so the wait feels like progress. */
+function StreamingPreview({ text }: { text: string }) {
+  const p = parsePartialBlock(text);
+  const hasQuestion = Boolean(p.stem || p.options);
+
+  return (
+    <div role="status" aria-live="polite">
+      <div className="card scenario-card scenario-new">
+        <span className="pill-tag">New scenario · writing…</span>
+        {p.title && <h2 className="serif scenario-title">{p.title}</h2>}
+        {p.scenario && <p className="scenario-text">{p.scenario}</p>}
+        {!p.title && !p.scenario && <p className="muted">Writing the scenario… ▍</p>}
+      </div>
+
+      {hasQuestion && (
+        <div className="card question-card">
+          {p.stem && <p className="stem">{p.stem}</p>}
+          <div className="options">
+            {OPTION_KEYS.map((key) =>
+              p.options?.[key] ? (
+                <div key={key} className="option option-dim">
+                  <span className="option-key">{key}</span>
+                  <span className="option-text">{p.options[key]}</span>
+                </div>
+              ) : null,
+            )}
+          </div>
+          <p className="muted small loading-meta">Claude is writing this question live… ▍</p>
+        </div>
       )}
     </div>
   );
@@ -414,6 +610,7 @@ function ExamHeader({
   onEnd: () => void;
 }) {
   const running = score.total > 0 ? scaledScore(score.correct, score.total) : null;
+  const pct = score.total > 0 ? Math.round((score.correct / score.total) * 100) : 0;
   const lowTime = remainingMs !== null && remainingMs < 5 * 60 * 1000;
   return (
     <div className="exam-header">
@@ -436,8 +633,8 @@ function ExamHeader({
           Question {globalNumber} of {totalPlanned}
         </span>
         <span className="muted small">
-          Score {score.correct}/{score.total}
-          {running !== null ? ` · ~${running} (vs ${PASS_BAR})` : ''}
+          {score.correct}/{score.total} correct · {pct}%
+          {running !== null ? ` · ~${running}/1000 (pass ${PASS_BAR})` : ''}
         </span>
         <button className="link-btn" onClick={onEnd} type="button">
           End &amp; see results

@@ -30,14 +30,22 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.mode === 'full') {
-      const id = await createSession(uid, 'full', null, buildFullMockPlan());
+      const plan = buildFullMockPlan();
+      const id = await createSession(uid, 'full', null, plan);
+      console.info(
+        `[sessions] Created full mock { id: '${id}', blocks: ${plan.length}, questions: ${plan.reduce((a, p) => a + p.count, 0)} }`,
+      );
       return json({ id }, 201);
     }
     if (body.mode === 'domain') {
       if (!isDomainCode(body.domain)) {
         return json({ error: 'A valid domain (D1–D5) is required.', code: 'BAD_DOMAIN' }, 400);
       }
-      const id = await createSession(uid, 'domain', body.domain, buildSingleDomainPlan(body.domain));
+      const plan = buildSingleDomainPlan(body.domain);
+      const id = await createSession(uid, 'domain', body.domain, plan);
+      console.info(
+        `[sessions] Created single-domain ${body.domain} { id: '${id}', blocks: ${plan.length}, questions: ${plan.reduce((a, p) => a + p.count, 0)} }`,
+      );
       return json({ id }, 201);
     }
     return json({ error: "mode must be 'full' or 'domain'.", code: 'BAD_MODE' }, 400);

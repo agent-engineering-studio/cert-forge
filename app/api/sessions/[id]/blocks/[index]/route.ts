@@ -33,16 +33,24 @@ export async function GET(req: NextRequest, { params }: Params) {
       return json({ error: 'Invalid block index.', code: 'BAD_REQUEST' }, 400);
     }
 
+    console.info(`[block] Request { session: '${id}', index: ${index} }`);
+
     // Ownership + range check via the session plan.
     const item = await getSessionPlanItem(id, uid, index);
     if (!item) return json({ error: 'Block not found.', code: 'NOT_FOUND' }, 404);
 
     // Already generated → serve from storage.
     const stored = await getStoredBlock(id, index);
-    if (stored) return json({ block: stored, cached: true });
+    if (stored) {
+      console.info(`[block] Served from cache { session: '${id}', index: ${index}, domain: '${item.domain}' }`);
+      return json({ block: stored, cached: true });
+    }
 
     // Need the API key only when we actually have to generate.
     if (!getApiKey()) {
+      console.warn(
+        `[block] No ANTHROPIC_API_KEY configured — cannot generate { session: '${id}', index: ${index} }`,
+      );
       return json(
         {
           error: 'ANTHROPIC_API_KEY is not configured on the server.',
@@ -54,6 +62,7 @@ export async function GET(req: NextRequest, { params }: Params) {
 
     const rl = rateLimit(clientIp(req));
     if (!rl.allowed) {
+      console.warn(`[block] Rate-limited { index: ${index}, retryAfter: ${rl.retryAfter}s }`);
       return json(
         { error: `Rate limit exceeded. Try again in ${rl.retryAfter}s.`, code: 'RATE_LIMITED' },
         429,
@@ -62,12 +71,20 @@ export async function GET(req: NextRequest, { params }: Params) {
     }
 
     const usedTitles = await listBlockTitles(id);
+    console.info(
+      `[block] Generating { session: '${id}', index: ${index}, domain: '${item.domain}', count: ${item.count} } — this can take a while on Opus…`,
+    );
+    const startedAt = Date.now();
     const block = await generateBlock(item.domain as DomainCode, item.count, usedTitles);
     await saveBlock(id, index, item.domain as DomainCode, block);
+    console.info(
+      `[block] Generated & saved { session: '${id}', index: ${index}, questions: ${block.questions.length}, ms: ${Date.now() - startedAt} }`,
+    );
 
     return json({ block: { ...block, domain: item.domain }, cached: false });
   } catch (err) {
     if (err instanceof GenerationError) {
+      console.warn(`[block] Generation failed { code: '${err.code}', status: ${err.status}, message: '${err.message}' }`);
       return json({ error: err.message, code: err.code }, err.status);
     }
     return errorResponse(err);

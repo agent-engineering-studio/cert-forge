@@ -41,7 +41,8 @@ Required environment (`.env.local`):
 - `ANTHROPIC_API_KEY` — your key (server-side only; never sent to the browser).
 - `AUTH_SECRET` — secret for signing the session cookie. Generate one with `openssl rand -hex 32`.
 - `DATABASE_URL` — Postgres connection string. The default `postgres://cca:cca@localhost:5432/cca` matches the bundled `make db` service.
-- `ANTHROPIC_MODEL` _(optional)_ — model used to generate questions (default `claude-sonnet-4-6`; e.g. `claude-opus-4-8`).
+- `ANTHROPIC_MODEL` _(optional)_ — model used to generate questions (default `claude-sonnet-4-6` — fast & cheap; set `claude-opus-4-8` for highest quality but slower generation).
+- `ANTHROPIC_EFFORT` _(optional)_ — thinking effort: `low` | `medium` | `high` | `max` (default `medium`). Lower is faster.
 - `ANTHROPIC_TIMEOUT_MS` _(optional)_ — per-generation timeout (default 120000).
 
 The schema is created automatically on first use (`CREATE TABLE IF NOT EXISTS`), so there's no separate migration step.
@@ -89,37 +90,42 @@ Open http://localhost:3000. Tail logs with `make logs`, open a DB shell with `ma
 
 ```bash
 docker build -t cca-exam-simulator .          # or: make docker-build
-docker run --rm -p 3000:3000 \
+docker run -d -p 3000:3000 \
   --env-file .env.local cca-exam-simulator     # or: make docker-run
 ```
 
-The key is passed in at **runtime** via `--env-file` / Compose `env_file` — it is never baked into the image. The container runs as an unprivileged `nextjs` user.
+`make docker-run` starts the container **detached** (in the background) and returns immediately — check it with `docker ps`, tail logs with `make docker-logs`, and stop/remove it with `make docker-stop`.
+
+Note: plain Docker runs the **app image alone, without a database**, so accounts and saved exams won't work. For the full stack (app + Postgres) use **`make up`** (Docker Compose). The key is passed in at **runtime** via `--env-file` / Compose `env_file` — it is never baked into the image. The container runs as an unprivileged `nextjs` user.
 
 ---
 
 ## How it works
 
-- Choose a **Full mock** (60 questions, weighted toward Domain 1, 120-minute timer) or a **Single domain** set (12 questions).
+- Create a (local) account, then choose a **Full mock** (60 questions, weighted toward Domain 1, 120-minute timer) or a **Single domain** set (12 questions).
 - Questions are generated in scenario blocks of 4–6. The frontend requests one block at a time and **prefetches the next** while you answer, so there's no visible wait after the first block.
 - Each question gives an immediate verdict, an explanation of all four options, and a running score (overall + per domain).
-- Results show a per-domain breakdown, an estimated scaled score (a simple linear estimate on the 100–1,000 scale vs. the ~720 pass bar), and the weakest domains to re-drill.
-- Progress is saved to `localStorage`, so a refresh won't lose your place. The server stays stateless.
+- Every exam is saved server-side in Postgres, so you can **pause and resume** from the profile page — even days later. Already-generated blocks are reused, so resuming never re-spends tokens.
+- For a full mock, the 120-minute clock starts only once the first scenario is ready — generation time doesn't eat into your exam time.
+- Results show a per-domain breakdown, an estimated scaled score (a simple linear estimate on the 100–1,000 scale vs. the ~720 pass bar), and the weakest domains to re-drill. Finished scores feed the profile stats and the AI coach.
 
 ### Domains and full-mock weighting
 
-| Code | Domain                                  | Questions |
-| ---- | --------------------------------------- | --------- |
-| D1   | Agentic Architecture & Orchestration    | 18        |
-| D2   | Tool Design & MCP Integration           | 12        |
-| D3   | Claude Code Configuration & Workflows   | 10        |
-| D4   | Prompt Engineering & Structured Output  | 10        |
-| D5   | Context Management & Reliability        | 10        |
+| Code | Domain                                  | Weight | Questions |
+| ---- | --------------------------------------- | ------ | --------- |
+| D1   | Agentic Architecture & Orchestration    | 27%    | 16        |
+| D2   | Tool Design & MCP Integration           | 18%    | 11        |
+| D3   | Claude Code Configuration & Workflows   | 20%    | 12        |
+| D4   | Prompt Engineering & Structured Output  | 20%    | 12        |
+| D5   | Context Management & Reliability        | 15%    | 9         |
 
 ---
 
 ## Cost
 
-Questions are generated live, so each session uses Claude API tokens billed to **your** key. A full 60-question mock is roughly a few dozen cents of usage, depending on the model (`claude-sonnet-4-6` by default; Opus-tier models cost more). Single-domain sets cost proportionally less.
+Questions are generated live, so each session uses Claude API tokens billed to **your** key. Cost and speed depend on the model — `claude-sonnet-4-6` by default (fast and cheap); switch `ANTHROPIC_MODEL` to `claude-opus-4-8` for the highest-quality (but slower, pricier) questions. Single-domain sets cost proportionally less than a full 60-question mock.
+
+Generated blocks are persisted per session, so **resuming a paused exam re-spends no tokens** — you only pay to generate each scenario once. The AI performance coach is a separate, small request you trigger from the profile page.
 
 ## Rate limiting
 
@@ -172,6 +178,14 @@ A `Makefile` wraps the npm scripts plus the Docker workflow. Run `make help` (th
 | `make up`   | Build and start via docker compose (detached) |
 | `make down` | Stop and remove compose services              |
 | `make logs` | Tail compose logs                             |
+
+### Database
+
+| Command         | What it does                                                |
+| --------------- | ----------------------------------------------------------- |
+| `make db`       | Start only the Postgres service (for `make dev`)            |
+| `make db-shell` | Open a `psql` shell in the Postgres container               |
+| `make db-reset` | Drop the Postgres data volume (destroys all users/sessions) |
 
 ### Housekeeping
 

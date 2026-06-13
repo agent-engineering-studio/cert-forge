@@ -48,7 +48,7 @@ export async function interpretStats(stats: UserStats): Promise<string> {
   }
 
   const model = process.env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
-  const client = new Anthropic({ apiKey, maxRetries: 2 });
+  const client = new Anthropic({ apiKey, maxRetries: 0 });
   const payload = JSON.stringify(statsForModel(stats), null, 2);
 
   console.info(
@@ -57,10 +57,10 @@ export async function interpretStats(stats: UserStats): Promise<string> {
 
   let response;
   try {
-    response = await client.messages.create(
+    const stream = client.messages.stream(
       {
         model,
-        max_tokens: 2000,
+        max_tokens: 3000,
         system: COACH_SYSTEM_PROMPT,
         messages: [
           {
@@ -69,8 +69,9 @@ export async function interpretStats(stats: UserStats): Promise<string> {
           },
         ],
       },
-      { timeout: 60_000 },
+      { timeout: 90_000 },
     );
+    response = await stream.finalMessage();
   } catch (err) {
     throw mapUpstreamError(err);
   }

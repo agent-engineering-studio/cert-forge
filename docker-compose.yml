@@ -7,15 +7,16 @@ services:
     container_name: cca-exam-simulator
     ports:
       - "3000:3000"
+    # ANTHROPIC_API_KEY, ANTHROPIC_MODEL, and AUTH_SECRET come from .env.local
+    # (via env_file). Do NOT also list them under `environment:` with
+    # ${VAR}/${VAR:-default} — that interpolates from the host shell and, since
+    # `environment` overrides `env_file`, an unset host var would clobber the
+    # real value from .env.local with an empty string (or the default).
     environment:
-      # Provide your Anthropic key via a local .env file (never committed).
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-6}
-      # Auth secret for signing session cookies (set a strong value in .env.local).
-      - AUTH_SECRET=${AUTH_SECRET:-dev-insecure-secret-change-me}
-      # Connect to the bundled Postgres service below.
-      - DATABASE_URL=${DATABASE_URL:-postgres://cca:cca@db:5432/cca}
       - NODE_ENV=production
+      # Inside the compose network the DB is reachable at host `db`, so override
+      # whatever DATABASE_URL .env.local uses for `make dev` (localhost).
+      - DATABASE_URL=${DATABASE_URL:-postgres://cca:cca@db:5432/cca}
     env_file:
       - path: .env.local
         required: false

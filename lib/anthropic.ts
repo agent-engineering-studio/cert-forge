@@ -6,8 +6,8 @@ import type { DomainCode, ExamBlock } from './types';
 import { validateBlock } from './validate';
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
-/** Hard cap per upstream call; the SDK aborts after this and we surface a clean error. */
-const DEFAULT_TIMEOUT_MS = 120_000;
+/** Wall-clock cap per streamed call; we abort and surface a clean timeout after this. */
+const DEFAULT_TIMEOUT_MS = 240_000;
 
 /** Lightweight server log helper. Prefixed + never includes the API key. */
 function log(message: string, extra?: Record<string, unknown>) {
@@ -20,10 +20,67 @@ function requestTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
 }
 
-/** Budget output tokens by question count (4 options + 4 explanations each). */
-function maxTokensFor(count: number): number {
-  return Math.min(16_000, 2_000 + count * 1_600);
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+type Effort = (typeof EFFORT_LEVELS)[number];
+
+/**
+ * How hard Opus thinks before answering. Default `medium` keeps generation
+ * fast (high/xhigh can take 1–2 minutes per block); raise it for tougher
+ * questions, lower it for snappier sessions. Override via ANTHROPIC_EFFORT.
+ */
+function effortLevel(): Effort {
+  const raw = process.env.ANTHROPIC_EFFORT?.trim();
+  return (EFFORT_LEVELS as readonly string[]).includes(raw ?? '') ? (raw as Effort) : 'medium';
 }
+
+/** Budget output tokens by question count (4 options + 4 explanations each). */
+function maxTokensFor(count: number, attempt: number): number {
+  // Streaming lifts the non-streaming timeout ceiling, so we can be generous;
+  // a retry gets extra headroom in case the first response was truncated.
+  const base = 4_000 + count * 2_400;
+  return Math.min(32_000, attempt === 0 ? base : Math.round(base * 1.5));
+}
+
+/**
+ * JSON Schema for one scenario block, enforced via structured outputs so the
+ * model cannot emit malformed JSON (eliminating the parse-retry path that was
+ * the main source of slow, looping generations).
+ */
+const OPTIONS_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    A: { type: 'string' },
+    B: { type: 'string' },
+    C: { type: 'string' },
+    D: { type: 'string' },
+  },
+  required: ['A', 'B', 'C', 'D'],
+} as const;
+
+const BLOCK_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    scenario_title: { type: 'string' },
+    scenario: { type: 'string' },
+    questions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          stem: { type: 'string' },
+          options: OPTIONS_SCHEMA,
+          correct: { type: 'string', enum: ['A', 'B', 'C', 'D'] },
+          explanations: OPTIONS_SCHEMA,
+        },
+        required: ['stem', 'options', 'correct', 'explanations'],
+      },
+    },
+  },
+  required: ['scenario_title', 'scenario', 'questions'],
+} as const;
 
 /** Carries an HTTP status + machine code so the route can map it to clean JSON. */
 export class GenerationError extends Error {
@@ -48,23 +105,36 @@ function buildUserMessage(domain: DomainCode, count: number, usedTitles: string[
   const avoid = usedTitles.length ? usedTitles.map((t) => `- ${t}`).join('\n') : '(none yet)';
   return [
     `Target domain: ${domain} — ${info.name}`,
+    `Domain scope: ${info.blurb}`,
+    `STRICT: the question MUST test ${info.name} specifically. The scenario and the decision being asked about must sit squarely within this domain — do not drift into another domain's topic.`,
     `Questions in this block: ${count}`,
     `Already-used scenario titles/industries to avoid repeating:`,
     avoid,
     ``,
-    `Author exactly ONE new, original production scenario for domain ${domain} and ${count} questions anchored to it. Respond with ONLY the JSON object — no prose, no code fences.`,
+    // Keep output tight: generation time scales directly with characters
+    // produced, and verbose explanations are the bulk of it.
+    `BE CONCISE (speed matters): scenario ≤ 2 sentences; each option ≤ 1 short sentence; each explanation ≤ 1 sentence (the single strongest distractor may use 2). State the mechanism, no preamble, no padding.`,
+    ``,
+    count === 1
+      ? `Generate EXACTLY ONE question. The "questions" array MUST contain a SINGLE object — never 2, never more. Ignore any general guidance about 3–6 questions per scenario: for THIS request the count is 1. Author one new, original production scenario for domain ${domain} with that single question anchored to it. Respond with ONLY the JSON object — no prose, no code fences.`
+      : `Author exactly ONE new, original production scenario for domain ${domain} and EXACTLY ${count} questions (no more, no fewer) anchored to it. Respond with ONLY the JSON object — no prose, no code fences.`,
   ].join('\n');
 }
 
 /**
- * Generate one validated scenario block. Calls the model, robustly extracts
- * JSON, validates the schema, and retries ONCE on malformed output before
- * giving up with a 502.
+ * Generate one validated scenario block.
+ *
+ * Uses streaming (so a long, high-`max_tokens` Opus generation can't hit the
+ * SDK's request-timeout) plus structured outputs (so the model can't emit
+ * malformed JSON). `maxRetries: 0` keeps the SDK from silently retrying a slow
+ * request several times over — we control retries here, with a hard wall-clock
+ * abort per attempt. Retries ONCE (with extra token headroom) on truncation.
  */
 export async function generateBlock(
   domain: DomainCode,
   count: number,
   usedTitles: string[],
+  onText?: (delta: string) => void,
 ): Promise<ExamBlock> {
   const apiKey = getApiKey();
   if (!apiKey) {
@@ -73,35 +143,86 @@ export async function generateBlock(
 
   const model = process.env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
   const timeout = requestTimeoutMs();
-  const maxTokens = maxTokensFor(count);
-  // We do our own malformed-output retry; let the SDK retry only transient network errors.
-  const client = new Anthropic({ apiKey, maxRetries: 2 });
+  const effort = effortLevel();
+  // We control retries ourselves; the SDK's default (2) would re-run a slow
+  // request on timeout and stack the waits, which is what caused the long hang.
+  const client = new Anthropic({ apiKey, maxRetries: 0 });
   const userMessage = buildUserMessage(domain, count, usedTitles);
 
-  log('Generating block', { domain, count, model, maxTokens, timeoutMs: timeout, usedTitles: usedTitles.length });
+  log('Generating block', {
+    domain,
+    count,
+    model,
+    effort,
+    timeoutMs: timeout,
+    usedTitles: usedTitles.length,
+  });
 
   let lastParseError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
+    const maxTokens = maxTokensFor(count, attempt);
     const content =
       attempt === 0
         ? userMessage
-        : `${userMessage}\n\nYour previous response could not be parsed as the required JSON. Respond again with ONLY the JSON object described in the system prompt.`;
+        : `${userMessage}\n\nYour previous response was incomplete. Produce the full JSON object for all ${count} questions.`;
 
+    // Hard wall-clock cap: abort the stream if it stalls past the timeout.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
     const startedAt = Date.now();
-    let response;
+    let response: Anthropic.Message;
     try {
-      response = await client.messages.create(
+      log('Stream opened — waiting for Claude to produce the block', { domain, attempt, model, maxTokens });
+      // Structured outputs guarantee valid JSON but add constrained-decoding
+      // latency on this nested schema. Default ON; set ANTHROPIC_STRUCTURED_OUTPUT=off
+      // to fall back to free-form JSON (parsed by extractJson, retried on failure).
+      const useStructured = process.env.ANTHROPIC_STRUCTURED_OUTPUT?.trim() !== 'off';
+      const outputConfig = useStructured
+        ? { effort, format: { type: 'json_schema' as const, schema: BLOCK_SCHEMA } }
+        : { effort };
+      const stream = client.messages.stream(
         {
           model,
           max_tokens: maxTokens,
-          system: EXAM_SYSTEM_PROMPT,
+          // Cache the (identical) system prompt so calls after the first skip
+          // reprocessing it — lower latency and cost per question.
+          system: [{ type: 'text', text: EXAM_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+          // No extended thinking: the system prompt fully specifies the task, so
+          // thinking only adds latency for this generation.
+          thinking: { type: 'disabled' },
+          output_config: outputConfig,
           messages: [{ role: 'user', content }],
         },
-        { timeout },
+        { signal: controller.signal },
       );
+
+      // Heartbeat so the container logs show progress during the (slow) stream
+      // instead of going silent for ~100s on Opus.
+      let streamedChars = 0;
+      let lastBeat = Date.now();
+      stream.on('text', (delta) => {
+        onText?.(delta);
+        streamedChars += delta.length;
+        const now = Date.now();
+        if (now - lastBeat >= 5_000) {
+          lastBeat = now;
+          log('Streaming…', { domain, attempt, chars: streamedChars, elapsedMs: now - startedAt });
+        }
+      });
+
+      response = await stream.finalMessage();
     } catch (err) {
       log('Upstream call failed', { domain, attempt, ms: Date.now() - startedAt, error: errLabel(err) });
+      if (controller.signal.aborted) {
+        throw new GenerationError(
+          'Generating this scenario took too long and timed out. Try again.',
+          504,
+          'UPSTREAM_TIMEOUT',
+        );
+      }
       throw mapUpstreamError(err);
+    } finally {
+      clearTimeout(timer);
     }
 
     const elapsed = Date.now() - startedAt;
@@ -121,11 +242,19 @@ export async function generateBlock(
     });
 
     if (response.stop_reason === 'max_tokens') {
-      log('Response was truncated at max_tokens — output likely incomplete', { domain, attempt, maxTokens });
+      log('Response truncated at max_tokens — retrying with more headroom', { domain, attempt, maxTokens });
     }
 
     try {
       const block = validateBlock(extractJson(text));
+      if (block.questions.length > count) {
+        log('Model over-generated — trimming to requested count', {
+          domain,
+          got: block.questions.length,
+          count,
+        });
+        block.questions = block.questions.slice(0, count);
+      }
       log('Block validated', { domain, count, attempt, questions: block.questions.length, ms: elapsed });
       return block;
     } catch (err) {

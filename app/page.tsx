@@ -135,7 +135,9 @@ export default async function HomePage() {
                   <strong>
                     {d.code} — {d.name}
                   </strong>
-                  <span className="muted small">{d.fullMockQuestions} in a full mock</span>
+                  <span className="muted small">
+                    {d.weightPct}% · {d.fullMockQuestions} in a full mock
+                  </span>
                 </div>
                 <p className="muted small">{d.blurb}</p>
               </li>

@@ -40,11 +40,14 @@ test: ## Run the unit tests
 docker-build: ## Build the production Docker image
 	docker build -t $(IMAGE) .
 
-docker-run: ## Run the image (reads .env.local for ANTHROPIC_API_KEY)
-	docker run --rm -p $(PORT):3000 --env-file .env.local --name $(CONTAINER) $(IMAGE)
+docker-run: ## Run the image in the background (reads .env.local)
+	-docker rm -f $(CONTAINER) 2>/dev/null
+	docker run -d -p $(PORT):3000 --env-file .env.local --name $(CONTAINER) $(IMAGE)
+	@echo "Started '$(CONTAINER)' on http://localhost:$(PORT) — logs: make docker-logs"
+	@echo "Note: this runs the app image alone, with no database. For the full stack (app + Postgres) use 'make up'."
 
-docker-stop: ## Stop the running container
-	-docker stop $(CONTAINER)
+docker-stop: ## Stop and remove the running container
+	-docker rm -f $(CONTAINER)
 
 docker-logs: ## Tail logs from the running container
 	docker logs -f $(CONTAINER)
