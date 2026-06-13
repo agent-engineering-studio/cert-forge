@@ -32,10 +32,10 @@ export default async function HomePage() {
     <>
       <nav className="site-nav">
         <div className="site-nav-inner">
-          <a className="brand" href="/">
+          <Link className="brand" href="/">
             <span className="brand-mark">CCA</span>
             CCA Exam Simulator
-          </a>
+          </Link>
           <div className="nav-links">
             <a href="#domains">Domains</a>
             <a href="#how">How it works</a>
@@ -177,10 +177,10 @@ export default async function HomePage() {
         <footer className="page-footer">
           <div className="footer-top">
             <div className="footer-brand">
-              <a className="brand" href="/">
+              <Link className="brand" href="/">
                 <span className="brand-mark">CCA</span>
                 CCA Exam Simulator
-              </a>
+              </Link>
               <p>Live, scenario-based practice for the CCA Foundations exam.</p>
             </div>
             <div className="footer-cols">
